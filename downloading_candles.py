@@ -11,7 +11,7 @@ import pandas as pd
 DATE_FROM = "2010-01-01"
 DATE_TO   = "2019-12-31"
 MIN_ROWS  = 1800
-OUTPUT    = "all_tickers_candles_2010_2019_80ticks.csv"
+OUTPUT    = "all_tickers_candles_2010_2019.csv"
 
 TICKERS = [
     # Технологии
