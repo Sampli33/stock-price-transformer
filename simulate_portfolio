@@ -1,0 +1,524 @@
+"""
+Симулирует торговлю портфелем на основе вероятностей роста от модели
+PatchTST: периодическая ребалансировка long/short корзин с учётом
+транзакционных издержек, сравнение с equal-weight Buy & Hold бенчмарком.
+
+В отличие от backtest_model.py (усреднённый "слоистый" PnL по всем
+сигналам), здесь моделируется одна конкретная торговая история во времени:
+конечный стартовый капитал, конкретные даты входа/выхода, конкретное число
+акций на сделку и накопленные комиссии - то есть "прогон одной стратегии",
+а не статистика по множеству перекрывающихся позиций.
+
+Вход:
+    PKL_PATH - dataset_ready.pkl (тестовые вероятности/тикеры/даты).
+    DATA_PATH - CSV с ценами закрытия (для оценки портфеля по датам).
+    MODEL_PATH - веса обученной модели PatchTST.
+
+Параметры симуляции (константы):
+    INITIAL_CAPITAL         - стартовый капитал.
+    REBALANCE_DAYS          - раз в сколько торговых дней портфель
+                              полностью закрывается и открывается заново.
+    TOP_N_LONGS/SHORTS      - сколько тикеров брать в лонг/шорт корзину
+                              (ранжирование по вероятности модели).
+    LONG/SHORT_ALLOCATION   - доля капитала на лонги/шорты
+    TC_BPS                  - транзакционные издержки в базисных пунктах
+                              за сделку (взимаются и при открытии, и при
+                              закрытии позиции).
+    SIM_START_DATE/END_DATE - период симуляции.
+    TRADING_DAYS            - количество торговых дней в периоде симуляции
+                              (используется для расчёта числа циклов
+                              ребалансировки в год при аннуализации).
+
+Пайплайн:
+    1. Инференс модели на test: вероятность роста по каждому (тикер, дата).
+    2. На каждую дату ребалансировки:
+       a. Закрытие всех открытых позиций по цене закрытия дня, фиксация
+          PnL и уплата TC.
+       b. Отбор новых лонг/шорт корзин по topN вероятности, равновзвешенное
+          открытие новых позиций, уплата TC.
+       (На последнем цикле - только закрытие, без открытия новых позиций.)
+    3. Equal-weight Buy & Hold бенчмарк за тот же период (без ребалансировок).
+    4. Итоговые метрики: доходность, аннуализированная доходность,
+       волатильность, Sharpe, максимальная просадка.
+    5. Сохранение полного текстового лога симуляции и графика кривой
+       капитала (стратегия vs бенчмарк).
+
+Выход:
+    LOG_PATH - полный текстовый лог всех циклов ребалансировки и итогов.
+    PNG-график кривой капитала (сохраняется рядом со скриптом).
+"""
+
+import numpy as np
+import pandas as pd
+import pickle
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+PKL_PATH = 'dataset_ready.pkl'
+DATA_PATH = 'all_tickers_candles_2010_2019.csv'
+MODEL_PATH = 'best_model_patchtst.pt'
+LOG_PATH = 'PatchTST_portfolio_simulation_log_2018-2019.txt'
+
+INITIAL_CAPITAL = 10000.0
+REBALANCE_DAYS = 5
+TOP_N_LONGS = 3
+TOP_N_SHORTS = 3
+LONG_ALLOCATION = 0.5
+SHORT_ALLOCATION = 0.5
+
+TC_BPS = 5
+
+SIM_START_DATE = pd.Timestamp("2018-07-05")
+SIM_END_DATE = pd.Timestamp("2019-12-31")
+
+TRADING_DAYS = 374
+RISK_FREE = 0.0
+
+with open(PKL_PATH, 'rb') as f:
+    datasets = pickle.load(f)
+
+N_FEATURES = datasets["train"]["X"].shape[2]
+SEQ_LEN = datasets["train"]["X"].shape[1]
+print(f"Форма входа: (batch, {SEQ_LEN}, {N_FEATURES})")
+
+
+class PatchTST(nn.Module):
+    """Трансформер-классификатор PatchTST для многомерных временных рядов.
+
+    Архитектура идентична использованной при обучении (см. train_model.py):
+    """
+
+    def __init__(self,
+                 n_features = N_FEATURES,
+                 seq_len = SEQ_LEN,
+                 patch_len = 12,
+                 stride = 6,
+                 d_model = 64,
+                 nhead = 4,
+                 num_layers = 2,
+                 dim_ff = 128,
+                 dropout = 0.3):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.n_features = n_features
+        self.d_model = d_model
+        self.num_patches = (seq_len - patch_len) // stride + 1
+
+        self.patch_proj = nn.Linear(patch_len, d_model)
+        self.pos_emb = nn.Embedding(self.num_patches, d_model)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_ff, dropout=dropout, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        head_in = n_features * d_model
+        self.head = nn.Sequential(
+            nn.LayerNorm(head_in), nn.Dropout(dropout),
+            nn.Linear(head_in, 64), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        """x: (batch, seq_len, n_features) -> logits (batch, 2)"""
+        B = x.size(0)
+        x = x.permute(0, 2, 1)
+        x = x.unfold(dimension=2, size=self.patch_len, step=self.stride)
+        _, C, N, P = x.shape
+        x = x.reshape(B * C, N, P)
+        x = self.patch_proj(x)
+        x = x + self.pos_emb(torch.arange(N, device=x.device))
+        x = self.transformer(x)
+        x = x.mean(dim=1)
+        x = x.reshape(B, C * self.d_model)
+        return self.head(x)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Устройство: {device}")
+
+model = PatchTST().to(device)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+model.eval()
+
+X_test = torch.tensor(datasets["test"]["X"], dtype=torch.float32)
+y_test = torch.tensor(datasets["test"]["y"], dtype=torch.long)
+test_loader = DataLoader(TensorDataset(X_test, y_test),
+                         batch_size=512, shuffle=False)
+
+# Инференс: только вероятность роста
+all_probs = []
+with torch.no_grad():
+    for X, _ in test_loader:
+        out = model(X.to(device))
+        probs = torch.softmax(out, dim=1)[:, 1]
+        all_probs.extend(probs.cpu().numpy())
+
+all_probs = np.array(all_probs)
+print(f"Тестовых примеров: {len(all_probs)}")
+
+test_tickers = np.array(datasets["test"]["tickers"])
+test_dates = pd.to_datetime(datasets["test"]["dates"])
+
+signals = pd.DataFrame({
+    "date": test_dates,
+    "ticker": test_tickers,
+    "prob": all_probs,
+}).sort_values(["date", "ticker"]).reset_index(drop=True)
+
+df_prices = pd.read_csv(DATA_PATH)
+df_prices["ticker"] = df_prices["ticker"].astype(object)
+df_prices["date"] = pd.to_datetime(df_prices["begin"])
+df_prices = (df_prices.sort_values(["ticker", "date"])
+                      .drop_duplicates(["ticker", "date"])
+                      .reset_index(drop=True))
+
+# Быстрый доступ к цене закрытия по (тикер, дата) - используется для
+# оценки портфеля и расчёта PnL на каждом шаге симуляции
+price_map = df_prices.set_index(["ticker", "date"])["close"].to_dict()
+
+# Ограничиваем сигналы окном симуляции и берём каждую REBALANCE_DAYS-ю дату
+# как точку ребалансировки портфеля
+sim_signals = signals[(signals["date"] >= SIM_START_DATE) &
+                      (signals["date"] <= SIM_END_DATE)]
+all_sim_dates = np.sort(sim_signals["date"].unique())
+
+rebalance_dates = [pd.Timestamp(d) for d in all_sim_dates[::REBALANCE_DAYS]]
+
+# Простой логгер: пишет и в консоль, и накапливает строки для сохранения
+# в текстовый файл в конце симуляции
+log_lines = []
+def log(msg=""):
+    print(msg)
+    log_lines.append(msg)
+
+log("СИМУЛЯЦИЯ СПЕКУЛЯТИВНОГО ПОРТФЕЛЯ НА ОСНОВЕ ПРОГНОЗОВ PatchTST")
+log("=" * 95)
+log(f"Стартовый капитал: \${INITIAL_CAPITAL:,.2f}")
+log(f"Период симуляции: {SIM_START_DATE.date()} - {SIM_END_DATE.date()}")
+log(f"Торговых дней в периоде: {len(all_sim_dates)}")
+log(f"Частота ребалансировки: каждые {REBALANCE_DAYS} торговых дней")
+log(f"Дат ребалансировки: {len(rebalance_dates)}")
+log(f"Стратегия: Long-Short market-neutral")
+log(f"Лонгов в корзине: {TOP_N_LONGS} (наибольшие prob класса 1)")
+log(f"Шортов в корзине: {TOP_N_SHORTS} (наибольшие prob класса 0)")
+log(f"Распределение капитала: {LONG_ALLOCATION:.0%} лонги / {SHORT_ALLOCATION:.0%} шорты")
+log(f"Взвешивание внутри корзины: equal-weight")
+log(f"Дробные акции: разрешены")
+log(f"Транзакционные издержки: {TC_BPS} bps ({TC_BPS/100:.3f}%) за сделку")
+log("=" * 95)
+
+capital = INITIAL_CAPITAL
+# Текущий открытый портфель: {тикер: (число_акций, сторона, цена_входа)}.
+# side = +1 для лонга, -1 для шорта.
+portfolio = {}
+history = [{"date": rebalance_dates[0] if rebalance_dates else SIM_START_DATE,
+                  "capital": INITIAL_CAPITAL,
+                  "n_longs": 0, "n_shorts": 0,
+                  "pnl": 0.0, "tc": 0.0}]
+total_tc_paid = 0.0
+n_trades = 0
+
+# Основной цикл: на каждую дату ребалансировки сначала закрываем
+# текущий портфель по цене закрытия дня, затем (если это не последний
+# цикл) открываем новый на основе свежих вероятностей модели
+for cycle_idx, current_date in enumerate(rebalance_dates):
+    is_last = (cycle_idx == len(rebalance_dates) - 1)
+
+    log()
+    log("═" * 95)
+    log(f"НЕДЕЛЯ {cycle_idx + 1} | Дата: {current_date.date()} | "
+        f"Капитал на начало: \${capital:,.2f}")
+    log("═" * 95)
+
+    cycle_pnl = 0.0
+    cycle_tc = 0.0
+
+    if len(portfolio) > 0:
+        log("\nЗАКРЫТИЕ ПОЗИЦИЙ (по ценам закрытия дня)")
+        log(f"{'Тикер':<8} {'Сторона':<7} {'Акций':>12} "
+            f"{'Цена вх.':>11} {'Цена зак.':>11} {'PnL, \$':>11} {'TC, \$':>8}")
+        log("  " + "─" * 87)
+
+        for tkr, (shares, side, entry_price) in portfolio.items():
+            close_price = price_map.get((tkr, current_date), np.nan)
+            if np.isnan(close_price):
+                log(f"{tkr}: нет цены на {current_date.date()}, закрываем по entry")
+                close_price = entry_price
+
+            # side учитывает направление сделки: для шорта прибыль растёт
+            # при падении цены, поэтому разница цен умножается на side
+            position_pnl = shares * (close_price - entry_price) * side
+
+            tc = abs(shares * close_price) * (TC_BPS / 1e4)
+
+            cycle_pnl += position_pnl
+            cycle_tc += tc
+            n_trades += 1
+
+            side_label = "LONG" if side == 1 else "SHORT"
+            log(f"{tkr:<8} {side_label:<7} {shares:>12,.4f} "
+                f"{entry_price:>11,.4f} {close_price:>11,.4f} "
+                f"{position_pnl:>+11,.2f} {tc:>8,.2f}")
+
+        capital += cycle_pnl - cycle_tc
+        total_tc_paid += cycle_tc
+
+        log("  " + "─" * 87)
+        log(f"Суммарный PnL недели: \${cycle_pnl:+,.2f}")
+        log(f"TC за закрытие: -\${cycle_tc:,.2f}")
+        log(f"Капитал после закрытия: \${capital:,.2f}  "
+            f"({(capital/INITIAL_CAPITAL-1)*100:+.2f}% от старта)")
+
+        portfolio = {}
+
+    if is_last:
+        log("\nПОСЛЕДНИЙ ЦИКЛ - новые позиции не открываются, фиксация капитала")
+        history.append({
+            "date": current_date,
+            "capital": capital,
+            "n_longs": 0, "n_shorts": 0,
+            "pnl": cycle_pnl, "tc": cycle_tc
+        })
+        break
+
+    day_signals = signals[signals["date"] == current_date].copy()
+    if len(day_signals) == 0:
+        log(f"\nНет сигналов модели на {current_date.date()}, капитал в кэше")
+        history.append({
+            "date": current_date,
+            "capital": capital,
+            "n_longs": 0, "n_shorts": 0,
+            "pnl": cycle_pnl, "tc": cycle_tc
+        })
+        continue
+
+    # Отбор корзин: топ по вероятности роста (лонги) и топ по вероятности
+    # падения, т.е. наименьшей prob класса 1 (шорты)
+    longs_df = day_signals.nlargest(TOP_N_LONGS, "prob")
+    shorts_df = day_signals.nsmallest(TOP_N_SHORTS, "prob")
+
+    # Исключаем тикеры без цены на дату ребалансировки - иначе позицию
+    # нельзя будет открыть/оценить
+    longs_df = longs_df[longs_df["ticker"].apply(
+        lambda t: not np.isnan(price_map.get((t, current_date), np.nan)))]
+    shorts_df = shorts_df[shorts_df["ticker"].apply(
+        lambda t: not np.isnan(price_map.get((t, current_date), np.nan)))]
+
+    n_longs = len(longs_df)
+    n_shorts = len(shorts_df)
+
+    if n_longs == 0 and n_shorts == 0:
+        log(f"\nНе удалось отобрать тикеры с ценами, капитал в кэше")
+        history.append({
+            "date": current_date,
+            "capital": capital,
+            "n_longs": 0, "n_shorts": 0,
+            "pnl": cycle_pnl, "tc": cycle_tc
+        })
+        continue
+
+    # Равновзвешенное распределение бюджета внутри каждой корзины
+    long_budget = capital * LONG_ALLOCATION
+    short_budget = capital * SHORT_ALLOCATION
+    per_long = long_budget / max(n_longs,  1)
+    per_short = short_budget / max(n_shorts, 1)
+
+    log(f"\nОТКРЫТИЕ НОВОГО ПОРТФЕЛЯ")
+    log(f"Капитал для распределения: \${capital:,.2f}")
+    log(f"На лонги: \${long_budget:,.2f}"
+        f"({n_longs} позиций × \${per_long:,.2f})")
+    log(f"На шорты: \${short_budget:,.2f}  "
+        f"({n_shorts} позиций × \${per_short:,.2f})")
+
+    open_tc = 0.0
+
+    log(f"\n  ЛОНГИ (наибольшие P):")
+    log(f"  {'Тикер':<8} {'prob':>7} {'Цена':>11} {'Акций':>12} "
+        f"{'Стоимость':>13} {'TC, \$':>8}")
+    log("  " + "─" * 64)
+    for _, row in longs_df.iterrows():
+        tkr = row["ticker"]
+        prob = row["prob"]
+        price = price_map[(tkr, current_date)]
+        shares = per_long / price
+        value = shares * price
+        tc = value * (TC_BPS / 1e4)
+        portfolio[tkr] = (shares, +1, price)
+        open_tc += tc
+        n_trades += 1
+        log(f"{tkr:<8} {prob:>7.4f} {price:>11,.4f} {shares:>12,.4f} "
+            f"{value:>13,.2f} {tc:>8,.2f}")
+
+    log(f"\nШОРТЫ (наименьшие P = наибольшие P):")
+    log(f"{'Тикер':<8} {'prob':>7} {'Цена':>11} {'Акций':>12} "
+        f"{'Стоимость':>13} {'TC, \$':>8}")
+    log("  " + "─" * 64)
+    for _, row in shorts_df.iterrows():
+        tkr = row["ticker"]
+        prob = row["prob"]
+        price = price_map[(tkr, current_date)]
+        shares = per_short / price
+        value = shares * price
+        tc = value * (TC_BPS / 1e4)
+        portfolio[tkr] = (shares, -1, price)
+        open_tc += tc
+        n_trades += 1
+        log(f"{tkr:<8} {prob:>7.4f} {price:>11,.4f} {shares:>12,.4f} "
+            f"{value:>13,.2f} {tc:>8,.2f}")
+
+    capital -= open_tc
+    total_tc_paid += open_tc
+
+    log(f"\nTC за открытие: -\${open_tc:,.2f}")
+    log(f"Капитал после открытия: \${capital:,.2f}")
+
+    history.append({
+        "date": current_date,
+        "capital": capital,
+        "n_longs": n_longs,
+        "n_shorts": n_shorts,
+        "pnl": cycle_pnl,
+        "tc": cycle_tc + open_tc,
+    })
+
+# Бенчмарк: купить равными долями в начале периода и держать до конца,
+# без ребалансировок и промежуточных сделок
+log("\n" + "═" * 95)
+log(" БЕНЧМАРК (равновзвешенный портфель тикеров, без ребалансировок)")
+log("═" * 95)
+
+bh_start_date = rebalance_dates[0]
+bh_end_date = rebalance_dates[-1]
+
+bh_tickers = []
+for tkr in signals["ticker"].unique():
+    if (not np.isnan(price_map.get((tkr, bh_start_date), np.nan)) and
+        not np.isnan(price_map.get((tkr, bh_end_date),   np.nan))):
+        bh_tickers.append(tkr)
+
+log(f"Тикеров в B&H: {len(bh_tickers)}")
+log(f"Дата покупки: {bh_start_date.date()}")
+log(f"Дата продажи: {bh_end_date.date()}")
+
+per_ticker_budget = INITIAL_CAPITAL / len(bh_tickers)
+bh_final = 0.0
+bh_tc = 0.0
+
+for tkr in bh_tickers:
+    p_start = price_map[(tkr, bh_start_date)]
+    p_end = price_map[(tkr, bh_end_date)]
+    shares = per_ticker_budget / p_start
+    final_value = shares * p_end
+    # TC считается один раз за покупку и один раз за продажу
+    bh_tc += (per_ticker_budget + final_value) * (TC_BPS / 1e4)
+    bh_final += final_value
+
+bh_final_with_tc = bh_final - bh_tc
+
+log(f"\nИтог (gross): \${bh_final:,.2f}  "
+    f"({(bh_final/INITIAL_CAPITAL-1)*100:+.2f}%)")
+log(f"Итог (с TC): \${bh_final_with_tc:,.2f}  "
+    f"({(bh_final_with_tc/INITIAL_CAPITAL-1)*100:+.2f}%)")
+
+final_capital = capital
+total_return = final_capital / INITIAL_CAPITAL - 1
+
+hist_df = pd.DataFrame(history).set_index("date")
+hist_df["capital"] = hist_df["capital"].astype(float)
+period_returns = hist_df["capital"].pct_change().dropna()
+
+# Аннуализация по календарным дням периода симуляции
+days_in_sim = (bh_end_date - bh_start_date).days
+ann_return = (1 + total_return) ** (365 / days_in_sim) - 1 if days_in_sim > 0 else np.nan
+
+# Число циклов ребалансировки в год - используется для приведения
+# волатильности межцикловых доходностей к годовой
+periods_per_year = TRADING_DAYS / REBALANCE_DAYS
+ann_vol = (period_returns.std() * np.sqrt(periods_per_year)
+                 if len(period_returns) > 1 else np.nan)
+sharpe = ((ann_return - RISK_FREE) / ann_vol
+                 if ann_vol and ann_vol > 0 else np.nan)
+
+cummax = hist_df["capital"].cummax()
+mdd = ((hist_df["capital"] - cummax) / cummax).min()
+
+log()
+log("═" * 95)
+log("ИТОГОВАЯ СВОДКА")
+log("═" * 95)
+log(f"Стартовый капитал: \${INITIAL_CAPITAL:,.2f}")
+log(f"Финальный капитал (стратегия): \${final_capital:,.2f}")
+log(f"Итоговая доходность: {total_return*100:+.2f}%")
+log(f"Годовая доходность (annualized): {ann_return*100:+.2f}%")
+if not np.isnan(ann_vol):
+    log(f"Годовая волатильность: {ann_vol*100:.2f}%")
+if not np.isnan(sharpe):
+    log(f"Sharpe Ratio: {sharpe:.4f}")
+log(f"Максимальная просадка: {mdd*100:.2f}%")
+log()
+log(f"Циклов ребалансировки: {len(rebalance_dates)}")
+log(f"Всего сделок: {n_trades}")
+log(f"Итого транзакционных издержек: \${total_tc_paid:,.2f}  "
+    f"({total_tc_paid/INITIAL_CAPITAL*100:.2f}% от стартового капитала)")
+log()
+log(f"Equal-Weight Benchmark (gross): \${bh_final:,.2f}  "
+    f"({(bh_final/INITIAL_CAPITAL-1)*100:+.2f}%)")
+log(f"Equal-Weight Benchmark (с TC {TC_BPS} bps): \${bh_final_with_tc:,.2f}  "
+    f"({(bh_final_with_tc/INITIAL_CAPITAL-1)*100:+.2f}%)")
+log()
+log(f"Стратегия vs Equal-Weight Benchmark (gross): \${final_capital - bh_final:+,.2f}  "
+    f"({(total_return - (bh_final/INITIAL_CAPITAL-1))*100:+.2f} п.п.)")
+
+with open(LOG_PATH, "w", encoding="utf-8") as f:
+    f.write("\n".join(log_lines))
+print(f"\nЛог сохранён: {LOG_PATH}")
+
+dates = [h["date"] for h in history]
+caps = [h["capital"] for h in history]
+
+# Бенчмарк по ежедневной переоценке (mark-to-market) для сравнения на
+# графике: сколько бы стоил equal-weight портфель в каждый день симуляции,
+# если купить его один раз в bh_start_date и не трогать
+bh_values_by_date = []
+for d in all_sim_dates:
+    d_ts = pd.Timestamp(d)
+    total = 0.0
+    n_valid = 0
+    for tkr in bh_tickers:
+        p_start = price_map.get((tkr, bh_start_date), np.nan)
+        p_now = price_map.get((tkr, d_ts), np.nan)
+        if not np.isnan(p_start) and not np.isnan(p_now):
+            shares = per_ticker_budget / p_start
+            total += shares * p_now
+            n_valid += 1
+    if n_valid > 0:
+        bh_values_by_date.append({"date": d_ts, "capital": total})
+bh_curve = pd.DataFrame(bh_values_by_date)
+
+fig, axes = plt.subplots(figsize=(14, 6))
+
+axes.plot(dates, caps, "o-", color="steelblue", linewidth=2,
+             label=f"PatchTST")
+if len(bh_curve) > 0:
+    axes.plot(bh_curve["date"], bh_curve["capital"], "--",
+                 color="gray", alpha=0.85,
+                 label=f"Equal-Weight Benchmark ({len(bh_tickers)} тикеров)")
+axes.axhline(INITIAL_CAPITAL, color="black", linestyle=":", linewidth=0.8,
+                label=f"Стартовый капитал = \${INITIAL_CAPITAL:,.0f}")
+axes.set_title("Кривая капитала", fontsize=13)
+axes.set_ylabel("Капитал, \$")
+axes.legend(loc="best")
+axes.grid(True, alpha=0.4)
+axes.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+plt.setp(axes.xaxis.get_majorticklabels(), rotation=30)
+plt.tight_layout()
+plt.savefig("simulation_(2019-06-05 по 2019-12-04).png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("График сохранён")
