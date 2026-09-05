@@ -32,7 +32,7 @@ from sklearn.preprocessing import RobustScaler
 import pickle
 
 DATA_PATH = "all_tickers_candles_2010_2019.csv"
-DATASET_PATH = "dataset_ready_ver2_horiz5_generalscaler.pkl"
+DATASET_PATH = "dataset_ready.pkl"
 
 SEQ_LEN = 60
 HORIZON = 5
